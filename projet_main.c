@@ -11,23 +11,31 @@
 #include "affichage.h"
 #include "file_manager.h"
 #include "types.h"
+#include "sessions.h"
 
 #define NB_TOURS_ESSAIS 20
 #define NB_TOURS_QUALIF 15
 #define NB_TOURS_COURSE 50
-#define BASE_TEMPS 70.0
 #define VARIATION_MIN -3000 // Minimum time variation in milliseconds
 #define VARIATION_MAX 3000  // Maximum time variation in milliseconds
-#define BASE_TEMPS_SEC 84.000
-#define NB_PILOTES 20
+#define BASE_TEMPS_SEC 30.000
 
-// Fonction pour générer un temps de tour aléatoire
-float generer_temps_tour() {
-    int random_variation = (rand() % (VARIATION_MAX - VARIATION_MIN + 1)) + VARIATION_MIN;
-    return BASE_TEMPS_SEC + (random_variation / 1000.0);
+
+//fonction pour generer un temps par secteurs
+float generer_temps_secteur() {
+    return BASE_TEMPS_SEC + ((rand() % (VARIATION_MAX - VARIATION_MIN + 1)) + VARIATION_MIN) / 1000.0;
 }
 
-// Fonction de tri des pilotes par meilleur temps
+//fonction pour attribuer un temps par pilotes
+void generer_temps_pilote(Pilote *pilote) {
+    pilote->secteur_1 = generer_temps_secteur();
+    pilote->secteur_2 = generer_temps_secteur();
+    pilote->secteur_3 = generer_temps_secteur();
+    pilote->dernier_temps_tour = pilote->secteur_1 + pilote->secteur_2 + pilote->secteur_3;
+}
+
+
+//fonction pour tirer les pilotes
 void tri_pilotes(Pilote pilotes[], int nb_pilotes) {
     for (int i = 0; i < nb_pilotes - 1; i++) {
         for (int j = 0; j < nb_pilotes - i - 1; j++) {
@@ -40,178 +48,117 @@ void tri_pilotes(Pilote pilotes[], int nb_pilotes) {
     }
 }
 
-// Executer phase de qualification
-void executer_phase_qualification(MemoirePartagee *mp, int nb_pilotes, const char *phase) {
-    for (int tour = 1; tour <= NB_TOURS_QUALIF; tour++) {
-        pid_t pid;
+//Fonctions pour les semaphores
+void gestion_semaphore(MemoirePartagee *mp, int is_writer) {
+    if (is_writer) {
+        sem_wait(&mp->mutex); // Protection des écrivains
+    } else {
+        sem_wait(&mp->mutLect);
+        mp->nbrLect++;
+        if (mp->nbrLect == 1) sem_wait(&mp->mutex); // Premier lecteur bloque les écrivains
+        sem_post(&mp->mutLect);
+    }
+}
+
+void fin_gestion_semaphore(MemoirePartagee *mp, int is_writer) {
+    if (is_writer) {
+        sem_post(&mp->mutex); // Libération des écrivains
+    } else {
+        sem_wait(&mp->mutLect);
+        mp->nbrLect--;
+        if (mp->nbrLect == 0) sem_post(&mp->mutex); // Dernier lecteur débloque les écrivains
+        sem_post(&mp->mutLect);
+    }
+}
+
+
+void cleanup(MemoirePartagee *mp, int shmid) {
+    shmdt(mp); // Détache la mémoire partagée
+    shmctl(shmid, IPC_RMID, NULL); // Supprime la mémoire partagée
+    sem_destroy(&mp->mutex); // Détruit les sémaphores
+    sem_destroy(&mp->mutLect);
+}
+
+//fonctions de base pour faire tourner les voitures
+void executer_tour(MemoirePartagee *mp, int nb_pilotes, const char *phase, int nb_tours) {
+    pid_t pid;
+    for (int tour = 1; tour <= nb_tours; tour++) {
         for (int i = 0; i < nb_pilotes; i++) {
             pid = fork();
             if (pid == 0) {
                 srand(getpid() + time(NULL));
-                float temps_tour = generer_temps_tour(BASE_TEMPS, 5);
-
-                sem_wait(&mp->mutex); // Section critique pour les écrivains
-                mp->pilotes[i].dernier_temps_tour = temps_tour;
-                if (mp->pilotes[i].temps_meilleur_tour == 0.0 || temps_tour < mp->pilotes[i].temps_meilleur_tour) {
-                    mp->pilotes[i].temps_meilleur_tour = temps_tour;
+                gestion_semaphore(mp, 1); // Section critique pour les écrivains
+                generer_temps_pilote(&mp->pilotes[i]);
+                if (mp->pilotes[i].temps_meilleur_tour == 0.0 || mp->pilotes[i].dernier_temps_tour < mp->pilotes[i].temps_meilleur_tour) {
+                    mp->pilotes[i].temps_meilleur_tour = mp->pilotes[i].dernier_temps_tour;
                 }
-                sem_post(&mp->mutex); // Fin de la section critique
+                fin_gestion_semaphore(mp, 1);
                 exit(0);
             }
         }
-
-        for (int i = 0; i < nb_pilotes; i++) {
-            wait(NULL);
-        }
-
-        // Section critique pour les lecteurs
-        sem_wait(&mp->mutLect);
-        mp->nbrLect++;
-        if (mp->nbrLect == 1) {
-            sem_wait(&mp->mutex); // Premier lecteur bloque les écrivains
-        }
-        sem_post(&mp->mutLect);
-
-        // Lecture
+        for (int i = 0; i < nb_pilotes; i++) wait(NULL); // Attente des processus enfants
+        gestion_semaphore(mp, 0); // Section critique pour les lecteurs
         tri_pilotes(mp->pilotes, nb_pilotes);
         afficher_resultats(mp->pilotes, nb_pilotes, phase);
-
-        // Fin de la section critique pour les lecteurs
-        sem_wait(&mp->mutLect);
-        mp->nbrLect--;
-        if (mp->nbrLect == 0) {
-            sem_post(&mp->mutex); // Dernier lecteur débloque les écrivains
-        }
-        sem_post(&mp->mutLect);
-
-        usleep(1000000); // Pause de 1 seconde entre les tours
+        fin_gestion_semaphore(mp, 0); // Fin de la section critique
+        usleep(1000000); // Pause de 1 seconde
     }
 }
 
-// Qualification
+void free_practice(MemoirePartagee *mp, int repeat) {
+    for (int i = 0; i < repeat; i++) {
+        char session_name[14]; // "FP" + up to 3 digits + null terminator
+        snprintf(session_name, sizeof(session_name), "FP%d", i + 1);
+        printf("Début des essais libres (%s)\n", session_name);
+        executer_tour(mp, NB_PILOTES, session_name, NB_TOURS_ESSAIS);
+    }
+}
+
+
 void qualification(MemoirePartagee *mp) {
-    // FP1
-    executer_phase_qualification(mp, NB_PILOTES, "FP1");
-    printf("Résultats après FP1 :\n");
-    afficher_resultats(mp->pilotes, NB_PILOTES, "FP1");
+    const int pilotes_q1 = NB_PILOTES, pilotes_q2 = 15, pilotes_q3 = 10;
+    printf("Début de la qualification\n");
 
-    // FP2
-    executer_phase_qualification(mp, NB_PILOTES, "FP2");
-    printf("Résultats après FP2 :\n");
-    afficher_resultats(mp->pilotes, NB_PILOTES, "FP2");
-
-    // FP3
-    executer_phase_qualification(mp, NB_PILOTES, "FP3");
-    printf("Résultats après FP3 :\n");
-    afficher_resultats(mp->pilotes, NB_PILOTES, "FP3");
-
-    // Q1 (15 pilotes avancent à Q2)
-    executer_phase_qualification(mp, NB_PILOTES, "Q1");
+    // Phase Q1
+    executer_tour(mp, pilotes_q1, "Q1", NB_TOURS_QUALIF);
     printf("Éliminés après Q1 :\n");
-    for (int i = 15; i < NB_PILOTES; i++) {
-        printf("%d. Pilote: %s\n", i + 1, mp->pilotes[i].nom);
-    }
-
-    // Q2 (10 pilotes avancent à Q3)
-    executer_phase_qualification(mp, 15, "Q2");
+    for (int i = pilotes_q2; i < NB_PILOTES; i++) printf("%d. Pilote: %s\n", i + 1, mp->pilotes[i].nom);
+    
+    // Phase Q2
+    executer_tour(mp, pilotes_q2, "Q2", NB_TOURS_QUALIF);
     printf("Éliminés après Q2 :\n");
-    for (int i = 10; i < 15; i++) {
-        printf("%d. Pilote: %s\n", i + 1, mp->pilotes[i].nom);
-    }
-
-    // Q3 (Top 10 pilotes)
-    executer_phase_qualification(mp, 10, "Q3");
+    for (int i = pilotes_q3; i < pilotes_q2; i++) printf("%d. Pilote: %s\n", i + 1, mp->pilotes[i].nom);
+    
+    // Phase Q3
+    executer_tour(mp, pilotes_q3, "Q3", NB_TOURS_QUALIF);
     printf("Résultats finaux de Q3 (Top 10) :\n");
-    for (int i = 0; i < 10; i++) {
-        printf("%d. Pilote: %s\n", i + 1, mp->pilotes[i].nom);
-    }
+    for (int i = 0; i < pilotes_q3; i++) printf("%d. Pilote: %s\n", i + 1, mp->pilotes[i].nom);
 }
 
-// Write session results to a CSV file
+void course(MemoirePartagee *mp) {
+    printf("Début de la course\n");
+    executer_tour(mp, NB_PILOTES, "Course", NB_TOURS_COURSE);
+}
+
+
+//fonctions pour ecrire les resultats dans un fichier csv
 void ecrire_resultats_csv(const char *filename, Pilote pilotes[], int nb_pilotes, const char *session) {
     char **data = malloc(nb_pilotes * sizeof(char *));
     for (int i = 0; i < nb_pilotes; i++) {
         char formatted_time[50];
         format_temps(pilotes[i].temps_meilleur_tour, formatted_time);
-        // Here you should format and write to CSV data (not shown in the snippet)
+        data[i] = malloc(100 * sizeof(char)); // Exemple de taille
+        snprintf(data[i], 100, "%s,%s,%f", pilotes[i].nom, session, pilotes[i].temps_meilleur_tour);
     }
     write_to_csv(filename, data, nb_pilotes, 0);
-    for (int i = 0; i < nb_pilotes; i++) {
-        free((void *)data[i]);
-    }
+    for (int i = 0; i < nb_pilotes; i++) free((void *)data[i]);
     free(data);
 }
 
-// Fonction pour générer un temps de course aléatoire
-float generer_temps_course() {
-    int random_variation = (rand() % (VARIATION_MAX - VARIATION_MIN + 1)) + VARIATION_MIN;
-    return BASE_TEMPS_SEC + (random_variation / 1000.0);  // Temps de base + variation aléatoire
-}
 
-// Fonction pour exécuter la phase de course
-void executer_phase_course(MemoirePartagee *mp, int nb_pilotes) {
-    for (int tour = 1; tour <= NB_TOURS_COURSE; tour++) {
-        pid_t pid;
-        for (int i = 0; i < nb_pilotes; i++) {
-            pid = fork();
-            if (pid == 0) {
-                srand(getpid() + time(NULL));
-                float temps_tour = generer_temps_course();
-                
-                sem_wait(&mp->mutex); // Section critique pour les écrivains
-                mp->pilotes[i].dernier_temps_tour = temps_tour;
-                // Mettez à jour les temps de chaque pilote pour simuler la course
-                mp->pilotes[i].temps_course_total += temps_tour;
-                sem_post(&mp->mutex); // Fin de la section critique
-                exit(0);
-            }
-        }
-
-        for (int i = 0; i < nb_pilotes; i++) {
-            wait(NULL);
-        }
-
-        // Section critique pour les lecteurs
-        sem_wait(&mp->mutLect);
-        mp->nbrLect++;
-        if (mp->nbrLect == 1) {
-            sem_wait(&mp->mutex); // Premier lecteur bloque les écrivains
-        }
-        sem_post(&mp->mutLect);
-
-        // Lecture des résultats après chaque tour de la course
-        tri_pilotes(mp->pilotes, nb_pilotes);
-        afficher_resultats(mp->pilotes, nb_pilotes, "Course");
-
-        // Fin de la section critique pour les lecteurs
-        sem_wait(&mp->mutLect);
-        mp->nbrLect--;
-        if (mp->nbrLect == 0) {
-            sem_post(&mp->mutex); // Dernier lecteur débloque les écrivains
-        }
-        sem_post(&mp->mutLect);
-
-        usleep(1000000); // Pause de 1 seconde entre les tours
-    }
-}
-
-// Simulation de la course après les qualifications
-void course(MemoirePartagee *mp) {
-    // Phase de course : tous les pilotes participent
-    printf("Début de la phase de course :\n");
-    executer_phase_course(mp, NB_PILOTES);
-    
-    // Affichage des résultats finaux de la course
-    printf("Résultats finaux de la course :\n");
-    for (int i = 0; i < NB_PILOTES; i++) {
-        printf("%d. Pilote: %s - Temps total de la course: %.3f secondes\n", 
-            i + 1, mp->pilotes[i].nom, mp->pilotes[i].temps_course_total);
-    }
-}
-
-// Modifications dans le main
-int main() {
-    // Création de la mémoire partagée et des sémaphores
+//fonction principale
+int main(int argc, char *argv[]) {
+    // Initialisation de la mémoire partagée et des sémaphores
     key_t key = ftok("f1_simulation", 65);
     int shmid = shmget(key, sizeof(MemoirePartagee), 0666 | IPC_CREAT);
     if (shmid == -1) {
@@ -219,7 +166,6 @@ int main() {
         exit(1);
     }
 
-    // Attachement de la mémoire partagée
     MemoirePartagee *mp = (MemoirePartagee *)shmat(shmid, NULL, 0);
     if (mp == (void *)-1) {
         perror("Erreur de rattachement de mémoire partagée");
@@ -227,27 +173,34 @@ int main() {
     }
 
     sem_init(&mp->mutex, 1, 1);   // Initialisation du mutex pour protéger les écrivains
-    sem_init(&mp->mutLect, 1, 1);  // Initialisation de la protection des lecteurs
-    mp->nbrLect = 0;               // Aucun lecteur actif au départ
+    sem_init(&mp->mutLect, 1, 1); // Initialisation de la protection des lecteurs
+    mp->nbrLect = 0;
 
-    // Initialisation des pilotes
-    for (int i = 0; i < NB_PILOTES; i++) {
-        snprintf(mp->pilotes[i].nom, sizeof(mp->pilotes[i].nom), "Pilote %d", i + 1);
-        mp->pilotes[i].temps_meilleur_tour = 0.0;
-        mp->pilotes[i].dernier_temps_tour = 0.0;
-        mp->pilotes[i].temps_course_total = 0.0;  // Initialisation du temps de course
+    if (argc != 2) {
+        printf("Usage: %s [session]\n", argv[0]);
+        printf("Sessions disponibles :\n");
+        printf("  fp1   : Free Practice 1\n");
+        printf("  fp2   : Free Practice 2\n");
+        printf("  fp3   : Free Practice 3\n");
+        printf("  q1    : Qualification Phase 1 (Q1)\n");
+        printf("  q2    : Qualification Phase 2 (Q2)\n");
+        printf("  q3    : Qualification Phase 3 (Q3)\n");
+        printf("  qualif: Qualification complète (Q1, Q2, Q3)\n");
+        printf("  race  : Course\n");
+        printf("  all   : Tout exécuter (Essais libres, qualifications, course)\n");
+        shmdt(mp);
+        shmctl(shmid, IPC_RMID, NULL);
+        sem_destroy(&mp->mutex);
+        sem_destroy(&mp->mutLect);
+        return 1;
     }
 
-    // Exécution des qualifications
-    qualification(mp);
+    // Appeler la fonction pour gérer la session
+    traiter_session(argv[1], mp);
 
-    // Exécution de la course
-    course(mp);
-
-    // Nettoyage : Détachement de la mémoire partagée et destruction des sémaphores
+    // Nettoyage
     shmdt(mp);
-    shmctl(shmid, IPC_RMID, NULL);  // Suppression de la mémoire partagée
-    
+    shmctl(shmid, IPC_RMID, NULL);
     sem_destroy(&mp->mutex);
     sem_destroy(&mp->mutLect);
 
